@@ -4,7 +4,7 @@ from pydantic import BaseModel, HttpUrl
 import requests
 from bs4 import BeautifulSoup
 import re
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 import logging
 
 # Configure logging
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Wikipedia Scraper API",
-    description="An API to scrape content from Wikipedia pages",
+    description="An API to scrape content from Wikipedia pages including tables and structured data",
     version="1.0.0"
 )
 
@@ -31,6 +31,7 @@ class WikipediaRequest(BaseModel):
     include_metadata: Optional[bool] = True
     include_links: Optional[bool] = False
     include_images: Optional[bool] = False
+    include_tables: Optional[bool] = True
 
 class WikipediaResponse(BaseModel):
     title: str
@@ -39,6 +40,7 @@ class WikipediaResponse(BaseModel):
     metadata: Optional[dict] = None
     links: Optional[List[str]] = None
     images: Optional[List[str]] = None
+    tables: Optional[List[Dict[str, Any]]] = None
     url: str
     success: bool
     message: str
@@ -56,9 +58,45 @@ def clean_text(text: str) -> str:
     text = re.sub(r'\[edit\]', '', text)
     return text
 
+def extract_table_data(table) -> Dict[str, Any]:
+    """Extract structured data from a Wikipedia table"""
+    table_data = {
+        "headers": [],
+        "rows": [],
+        "caption": None
+    }
+    
+    # Extract table caption if available
+    caption_elem = table.find('caption')
+    if caption_elem:
+        table_data["caption"] = clean_text(caption_elem.get_text())
+    
+    # Extract headers (th elements)
+    headers = table.find_all('th')
+    if headers:
+        table_data["headers"] = [clean_text(header.get_text()) for header in headers]
+    
+    # Extract rows (tr elements)
+    rows = table.find_all('tr')
+    for row in rows:
+        # Skip header rows (already processed)
+        if row.find('th'):
+            continue
+        
+        # Extract cells (td elements)
+        cells = row.find_all('td')
+        if cells:
+            row_data = [clean_text(cell.get_text()) for cell in cells]
+            # Only add rows that have content
+            if any(cell.strip() for cell in row_data):
+                table_data["rows"].append(row_data)
+    
+    return table_data
+
 def extract_wikipedia_content(url: str, include_metadata: bool = True, 
-                           include_links: bool = False, include_images: bool = False) -> WikipediaResponse:
-    """Extract content from a Wikipedia page"""
+                           include_links: bool = False, include_images: bool = False,
+                           include_tables: bool = True) -> WikipediaResponse:
+    """Extract content from a Wikipedia page including tables"""
     
     try:
         # Validate Wikipedia URL
@@ -86,8 +124,19 @@ def extract_wikipedia_content(url: str, include_metadata: bool = True,
         if not content_div:
             raise ValueError("Could not find content on the page")
         
-        # Remove unwanted elements
-        for unwanted in content_div.find_all(['script', 'style', 'sup', 'nav', 'table']):
+        # Extract tables if requested
+        tables = None
+        if include_tables:
+            table_elements = content_div.find_all('table', {'class': 'wikitable'})
+            if table_elements:
+                tables = []
+                for table in table_elements:
+                    table_data = extract_table_data(table)
+                    if table_data["rows"]:  # Only include tables with actual data
+                        tables.append(table_data)
+        
+        # Remove unwanted elements but keep tables if requested
+        for unwanted in content_div.find_all(['script', 'style', 'sup', 'nav']):
             unwanted.decompose()
         
         # Extract paragraphs for main content
@@ -159,6 +208,7 @@ def extract_wikipedia_content(url: str, include_metadata: bool = True,
             metadata=metadata,
             links=links,
             images=images,
+            tables=tables,
             url=url,
             success=True,
             message="Content extracted successfully"
@@ -182,7 +232,7 @@ async def root():
         "version": "1.0.0",
         "endpoints": {
             "GET /": "API information",
-            "POST /scrape": "Scrape Wikipedia page content",
+            "POST /scrape": "Scrape Wikipedia page content including tables",
             "GET /health": "Health check"
         }
     }
@@ -195,12 +245,13 @@ async def health_check():
 @app.post("/scrape", response_model=WikipediaResponse)
 async def scrape_wikipedia(request: WikipediaRequest):
     """
-    Scrape content from a Wikipedia page
+    Scrape content from a Wikipedia page including tables
     
     - **url**: The Wikipedia URL to scrape
     - **include_metadata**: Whether to include page metadata (default: True)
     - **include_links**: Whether to include internal Wikipedia links (default: False)
     - **include_images**: Whether to include image URLs (default: False)
+    - **include_tables**: Whether to include table data (default: True)
     """
     logger.info(f"Scraping request received for URL: {request.url}")
     
@@ -209,7 +260,8 @@ async def scrape_wikipedia(request: WikipediaRequest):
             str(request.url),
             include_metadata=request.include_metadata,
             include_links=request.include_links,
-            include_images=request.include_images
+            include_images=request.include_images,
+            include_tables=request.include_tables
         )
         logger.info(f"Successfully scraped content from: {request.url}")
         return result
